@@ -19,3 +19,7 @@
 - `contrib/muse-admin/` — 管理员侧 Muse 的待合并贡献区
 
 同步规矩见 [SYNC_PROTOCOL.md](SYNC_PROTOCOL.md)。
+
+## 相关仓库
+
+- 本人的公开个人档案（基本情况、偏好与长期决定）由管理员侧 Muse 维护在 personal-archive：https://github.com/chenguidong3-ai/personal-archive —— 那是个人背景包，本仓是两个 Muse 共建的知识库，两仓内容不重叠、互不替代。
