@@ -413,7 +413,7 @@ fi
 
 ### A7　SSH 通道参数口径（两条路径不要混）
 
-- **到云电脑（当前拓扑）**：直连可用、scp 可用。参数要点：清代理环境变量（`env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY`）＋ `-o ProxyCommand=none` ＋ `-i <操作员私钥>` ＋ `-o UserKnownHostsFile=<持久目录>/known_hosts -o GlobalKnownHostsFile=/dev/null`，目标 `Administrator@<云电脑IP>`。发送仍只做单次尝试。
+- **到云电脑（当前拓扑）**：直连可用、scp 可用。参数要点：清代理环境变量（`env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY`）＋ `-o ProxyCommand=none` ＋ `-i <操作员私钥>` ＋ `-o UserKnownHostsFile=<持久目录>/known_hosts -o GlobalKnownHostsFile=/dev/null`，目标 `Administrator@<云电脑IP>`。发送仍只做单次尝试。**2026-11-26 端口迁移更新**：云电脑 sshd 主用端口已改 42322（22 仅过渡保留，观察期满后关闭）；且沙箱直连 42322 被透明出口拦截（banner 交换超时），必须改走 nc HTTP CONNECT 代理——脚本内用单字包装脚本作 ProxyCommand（`~/workspace/clawbot-bridge/nc-proxy-live.sh`，内部即 `nc -X connect -x 198.19.0.1:3128 43.138.160.136 42322`），手敲命令用 `-o 'ProxyCommand=nc -X connect -x 198.19.0.1:3128 %h %p' -p 42322`（scp/sftp 用大写 `-P 42322`）；known_hosts 须预置 `[43.138.160.136]:42322` 条目，与 22 为同一把主机密钥、先以 HostKeyAlias 借既有信任校验、指纹一致才可信。
 - **到旧办公服务器（旧拓扑，仅存量维护时用）**：一律 `deploy/sshr.sh '<远端命令>'`（25 秒超时×8 次重试）；scp/SFTP 会卡死，文件走 tar 经 SSH 执行通道；发送用 `send-remote.sh`（参数同 send-win.sh，经 SSH 标准输入传文件、服务器侧以服务账号运行 send.py）。
 - 主机密钥重验：经控制台通道在目标机上读主机密钥指纹比对，不直接接受 keyscan 结果。
 
