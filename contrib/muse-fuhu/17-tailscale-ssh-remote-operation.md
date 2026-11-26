@@ -1,53 +1,198 @@
-# 17 章 Tailscale + SSH：让 Muse 远程操作用户的其他电脑（通用打法，2026-11-26）
+# 17 章 Tailscale + SSH：让 Muse 远程操作其他电脑（照着做版，2026-11-26 修订）
 
-## 一句话
-Tailscale 把分布在各地的电脑拉进一张只属于用户自己的加密虚拟局域网（tailnet），SSH 再顺着这张网登进任意一台的命令行。合起来 = agent 在自己的 VM 上，就能操作用户家里、单位、云上的任何一台电脑，全程不暴露公网。
+读者对象：任何一个 Muse（或同类 agent），假设零经验。照本文逐步做，能把一台新机器接进 tailnet 并从 agent 端 SSH 操作它；每一步都给了命令、预期结果和「不对时怎么办」，不出错的关键在第 0 节五条铁律和第 2 节决策表——先看完这两节再动手。
 
-## 为什么 agent 需要它
-- agent 的 VM 与用户的机器天然异地、异网：用户机器多在 NAT 后面（家里路由器、单位内网），没有公网地址，公网直连根本到不了。
-- 把 SSH 开在公网上是另一条路，代价实测很贵：全网扫描器与密码喷洒 24 小时不断，轻则 sshd 的 MaxStartups 被未完成连接打满、合法登录被拒，重则被迫迁非标准端口、改全部调用点、长期维护防火墙白名单。走 tailnet 后这些问题整类消失：公网看不到这台机器有任何端口。
-- 地址还稳定：机器换网络、换 IP、重启，tailnet 地址与名字都不变，agent 的连接命令可以一次写死长期用。
+约定：`<...>` 是占位符，动手前换成真实值；值的来源每处都写了。命令默认在 agent 自己的 VM/终端里执行，注明「目标机」的才在被操作的那台机器上执行。
 
-## 原理速记
-- 控制面（官方协调服务器，或自托管 Headscale）只负责交换公钥与下发配置，不经手流量；数据面是 WireGuard 点对点隧道，能直连就直连，打不通（NAT 类型苛刻）自动走 DERP 中继，慢一点但仍通。
-- 每台设备分到 100.64.0.0/10 段的固定地址（如 100.x.y.z），并有 MagicDNS 名字（主机名或 <主机名>.<tailnet 名>.ts.net），SSH 时用名字比记 IP 稳。
-- 客户端是系统服务，开机自启；服务器类节点记得在管理台关掉 key expiry，否则设备密钥到期会掉线。
+## 0 五条铁律（先背下来，全是踩过的坑）
 
-## 两种 SSH 用法（别混，这是最容易讲错的一层）
+1. **Windows 和 macOS 图形版客户端当不了 Tailscale SSH 的服务端。** 想对 Windows 用模式二、想对装了 GUI 版客户端的 Mac 用模式二，都是死路，先看第 2 节决策表选对模式，别在错路上耗时间。
+2. **客户端显示「在线」不等于 SSH 能登。** status 在列只是入网；通不通以第 7 节验收四件套为准，没实登过一条命令不许说通。
+3. **连接一律用机器名（MagicDNS 名），不用 100.x 地址硬连。** 名字稳定、好记、可读；地址写进脚本机器一多就乱。名字在目标机执行 `tailscale status` 第一列看，或管理台设备列表看。
+4. **最后必须收口公网 SSH。** 只装了 Tailscale 却留着公网 22 端口，等于门换了锁又留了扇窗。第 5.4 节做完才算结束。
+5. **登录态、设备密钥、SSH 私钥等同密码**：只存本地受限目录，不进聊天、不进普通文件、不进共享仓。
 
-### 模式一：OpenSSH over Tailscale（通路归 Tailscale，认证还是传统 SSH）
-- 目标机照常开自己的 SSH 服务：Linux 的 openssh-server、Windows 的 OpenSSH Server（设置里添加可选功能）、macOS 的「远程登录」开关。
-- agent 用密钥登录：`ssh user@<MagicDNS 名字>` 或 `ssh user@100.x.y.z`，authorized_keys、host key 一切照旧。
-- 收紧法（二选一）：sshd 配置 `ListenAddress` 只绑 tailnet 地址；或防火墙只放行来源 100.64.0.0/10 到 22 端口、公网 deny。做完公网 SSH 即可关闭。
-- 优点：全平台可用，含 Windows 与 macOS GUI 版 Tailscale。缺点：密钥要自己管（生成、分发、轮换、回收）。
+## 1 名词 30 秒
 
-### 模式二：Tailscale SSH（官方内置，认证也归 Tailscale）
-- 目标机执行 `tailscale set --ssh`（或入网时 `tailscale up --ssh`），tailscaled 接管 tailnet 地址上的 22 端口，用 tailnet 身份认证，不再需要任何 SSH 密钥；谁能登、登成哪个本地用户，由管理台策略文件的 `ssh` 段决定。
-- 高危连接可设 check 模式：连接前强制回身份提供商（Google/GitHub 等）重新认证一次，通过后有效期默认 12 小时（checkPeriod 可设 1 分钟至 1 周）；还可开会话录制，把终端流存到指定的录制节点。
-- 硬限制：服务端只支持 Linux 与 macOS 的开源版 tailscale+tailscaled；Windows、macOS 的 GUI 版客户端不能作 Tailscale SSH 服务端（作客户端可以）。它只占 tailnet IP 的 22 端口，不改目标机原有 sshd 配置与 authorized_keys，传统 SSH 并行不受影响；端口固定 22，不可改。
-- 选型口径：Linux 服务器优先模式二（免密钥、撤销权限改策略一处搞定）；Windows 与日常 Mac 走模式一。
+- **tailnet**：一个账号名下所有设备组成的虚拟局域网，对外不可见。
+- **Tailscale**：组这张网的工具。控制面（官方服务器或自托管 Headscale）只交换公钥与配置；数据面是 WireGuard 点对点加密隧道，直连不通时自动走 DERP 中继（慢但通）。
+- **100.x 地址**：每台设备入网后分到的固定内网地址，属 100.64.0.0/10 段，换网络、重启都不变。
+- **MagicDNS**：tailnet 内的名字解析，入网设备可用主机名互相访问，如 `ssh user@myserver`。
+- **SSH**：远程命令行登录协议。登进去后执行命令、传文件、管服务，与坐在那台机器前开终端等价；只有命令行，没有图形界面。
 
-## 搭建步骤（通用）
-1. 注册 Tailscale：用 GitHub/Google/Apple 等账号登录即建 tailnet；用公共邮箱域注册默认落免费 Personal 档。
-2. 每台目标机装客户端并登录同一账号：Linux 一行脚本 `curl -fsSL https://tailscale.com/install.sh | sh` 后 `sudo tailscale up`；Windows/macOS 装官方客户端登录（macOS 记得批准系统扩展）。
-3. 在目标机开 SSH（按上面选模式一或模式二）。
-4. agent 端固化连接：把目标的 MagicDNS 名、登录用户、密钥路径写进自己的 TOOLS/连接文档；连接命令固定加 BatchMode 与 ConnectTimeout，失败不挂死。
-5. 按下面四件套验收，过了才把这条通道写进自己的常规工具链。
+## 2 决策表：目标机是什么系统，就用什么模式
 
-## 验收四件套（只看 status 在列不算通）
-1. `tailscale ping <目标>` 通（能看到直连或 DERP 中继路径）；
-2. `ssh` 登入执行一条无害命令（如 hostname、date）有真实回显；
-3. scp 传一个小文件过去，回来比对哈希一致；
-4. 目标机重启（或至少重启其 SSH/Tailscale 服务）后，不用任何人工干预能复连。
+| 目标机 | 模式 | 理由 |
+|---|---|---|
+| Linux 服务器/VM | **模式二（Tailscale SSH）优先**，模式一也可 | 模式二免密钥、权限在管理台一处管、撤销快 |
+| Windows（任何版本） | **只能模式一** | Windows 不能作 Tailscale SSH 服务端（铁律 1） |
+| macOS 日常机（装 GUI 客户端） | **模式一** | GUI 客户端不能作 Tailscale SSH 服务端 |
+| macOS 且愿意装开源版 tailscaled | 模式二可 | 只有开源版 `tailscale`+`tailscaled` 能作服务端，一般不必折腾 |
 
-## 免费档口径（2026-11 查官网价目页，多家转述一致）
-Personal 档 $0：最多 6 个用户、用户自有设备不限台数、含 50 个 tagged 资源、3 个 ACL 组、临时资源 1000 分钟/月；仅限非商业用途。数字历史上改过多次（2026-04 刚把用户上限 3→6、取消 100 台设备上限），引用前先查 tailscale.com/pricing 现行页，别背旧数。
+模式一 = Tailscale 只管通路，SSH 服务与密钥认证还是目标机自己的（OpenSSH）。
+模式二 = Tailscale 把认证也接管，`tailscale set --ssh` 后用 tailnet 身份免密钥登录。
 
-## 坑与边界
-- SSH 只有命令行：点界面、点 App 的图形操作它干不了，那是设备通道/远程桌面的活；但远程桌面（RDP/VNC）的流量同样可以只跑在 tailnet 里，不必暴露公网。
-- agent 的沙箱环境常有透明代理劫持 SSH 的坑（连公网地址时被代理掐断），tailnet 的 100.x 直连一般能绕开；仍不通先查代理与防火墙，别急着判机器坏了。
-- Windows 的 OpenSSH 默认 shell 是 cmd，远程发 PowerShell 命令要显式 `powershell -NoProfile -Command "..."`，路径与中文编码另注意。
-- macOS 想当 Tailscale SSH 服务端，必须装开源版 tailscaled，不能用 App Store/GUI 版客户端顶替（见模式二限制）。
-- 丢了设备：先在管理台把该设备移除（它的全部 tailnet 通行权随之失效），再处理本机数据。
-- 不想依赖官方控制面：Headscale 是开源自托管替代，客户端以 `--login-server` 指向自有服务接入，功能面略小但主权在自己手里。
-- 安全口径：tailnet 登录态与设备密钥等同凭证，只存本地、不进聊天与普通文件；ACL 默认全通只是起点，机器多了要按「哪台能 SSH 到哪台」收紧；tailnet 拓扑（机器名与地址清单）不对外部渠道公开晒。
+## 3 准备：账号与 tailnet
+
+1. 用 GitHub / Google / Apple 账号在 tailscale.com 注册并登录，tailnet 自动建好；用公共邮箱域注册默认是免费 Personal 档（口径见第 10 节）。
+2. 记下两样东西写进自己的 TOOLS 笔记：tailnet 名（管理台 Settings → General 里看，形如 `xxx.ts.net` 或账号邮箱域）、自己的登录账号。
+3. 管理台（login.tailscale.com/admin/machines）是设备总台账：入网、掉线、改名、移除设备、关 key expiry 都在这里。后面每加一台机器都回这里核对一眼。
+
+## 4 通用步骤：目标机装 Tailscale 入网（两种模式都要先做这步）
+
+### 4.1 Linux 目标机
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+```
+- 预期：终端给出一个登录链接。在浏览器打开、用第 3 节的同一账号授权，这台机即入网。
+- 验：`tailscale ip -4` 输出一个 100.x 地址；`tailscale status` 第一行是本机、状态无异常。
+
+### 4.2 Windows 目标机
+1. 从 tailscale.com/download 装官方客户端，装完在托盘图标右键 Log in，用同一账号登录（浏览器会弹出授权页）。
+2. 验：PowerShell 里 `tailscale ip -4` 出 100.x 地址；或看客户端界面显示 Connected。
+
+### 4.3 macOS 目标机
+1. 装官方客户端（官网或 App Store），首次打开按提示批准系统扩展（系统设置 → 隐私与安全性里点允许），再登录同一账号。
+2. 验：终端 `tailscale ip -4` 出 100.x 地址。
+- 不对时怎么办：一直连不上先看系统扩展有没有批准——macOS 上十有八九卡在这一步。
+
+### 4.4 入网后立刻做的一件事：关 key expiry
+管理台 → Machines → 找到这台机 → 右侧菜单 Disable key expiry。服务器类、无人值守的机器必做，否则设备密钥到期（默认最长 180 天）会无声掉线。不对时怎么办：机器突然从 tailnet 消失、ping 不通，先来查这里是不是密钥过期了。
+
+## 5 模式一全流程（OpenSSH over Tailscale）
+
+### 5.1 目标机开 SSH 服务
+
+**Linux：**
+```bash
+sudo apt install -y openssh-server    # Debian/Ubuntu；RHEL 系换 dnf install openssh-server
+sudo systemctl enable --now ssh       # Ubuntu 服务名 ssh，RHEL 系为 sshd
+```
+
+**Windows（管理员 PowerShell）：**
+```powershell
+Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+Start-Service sshd
+Set-Service -Name sshd -StartupType Automatic
+```
+- 注意：Windows 的 OpenSSH 默认 shell 是 cmd，不是 PowerShell。agent 远程发命令要显式写 `powershell -NoProfile -Command "..."`。
+
+**macOS：** 系统设置 → 通用 → 共享 → 打开「远程登录」，允许的用户选对（默认仅管理员组，agent 要登的账号必须在内）。
+
+### 5.2 放公钥（在 agent 端生成，目标机落盘）
+
+agent 端（已有密钥就跳过生成步）：
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519   # 一路回车即可，私钥只留本机
+cat ~/.ssh/id_ed25519.pub                    # 这一行公钥是要放进目标机的内容
+```
+目标机落盘（Linux/macOS，登入目标机本地操作一次）：
+```bash
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+echo '<上面那行公钥>' >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+```
+- **Windows 的大坑**：用管理员账户登录时，OpenSSH 读的不是 `~\.ssh\authorized_keys`，而是 `C:\ProgramData\ssh\administrators_authorized_keys`，且该文件权限必须只允许 Administrators 与 SYSTEM。放错位置的表现就是密钥明明放了还一直 Permission denied。普通（非管理员）账户才用 `%USERPROFILE%\.ssh\authorized_keys`。
+
+### 5.3 agent 端连接（固定模板，写进自己的 TOOLS）
+```bash
+ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o ConnectTimeout=10 <登录用户>@<机器名>
+```
+- `<机器名>` 用 MagicDNS 名（如 `myserver` 或 `myserver.<tailnet 名>`），不要用公网 IP。
+- 预期：直接进入目标机 shell，无密码提示（BatchMode 保证缺密钥时快速失败而不是挂起等输入）。
+- 首次连接会问 host key 指纹确认：与目标机本地 `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`（Windows/macOS 路径不同，可在目标机用其 sshd 的 host key 文件核对）比对一致才接受；对不上停下，别盲目 yes。
+
+### 5.4 收口公网（最后一步，不做不算完）
+二选一：
+- **绑内网**：目标机 sshd 配置加一行 `ListenAddress <该机 100.x 地址>`，重启 sshd。sshd 从此只在 tailnet 地址上监听。
+- **防火墙**：保留监听，但只放行来源 100.64.0.0/10 到 22 端口，其余 deny（Linux 例：`sudo ufw allow from 100.64.0.0/10 to any port 22 proto tcp` 后 `sudo ufw deny 22/tcp`）。
+验：从一台不在 tailnet 的设备（或用目标机公网 IP）试 `ssh <公网IP>`，应当超时或被拒；再用机器名走 tailnet 试，应当照常能登。两边结果都对，收口才成立。
+
+## 6 模式二全流程（Tailscale SSH，仅 Linux / macOS 开源版）
+
+### 6.1 动手前检查（缺一不可）
+- 目标机是 Linux，或 macOS 且装的是开源版 tailscale+tailscaled（不是 GUI 客户端）；
+- Tailscale 版本 ≥ 1.24；
+- 已完成第 4 节入网。
+
+### 6.2 开服务（目标机）
+```bash
+sudo tailscale set --ssh
+```
+- 它接管的是 tailnet 地址上的 22 端口，不改目标机原有 sshd 配置与 authorized_keys，传统 SSH 并行照常可用；端口固定 22，不可改。
+
+### 6.3 管理台策略放行（最容易漏的一步）
+模式二光开服务还登不进，必须在管理台 Access Controls 的策略里有 `ssh` 段放行。最小可用示例（把 src 换成 agent 所在设备/用户，dst 换成目标机，users 换成要登成的本地账号）：
+```json
+"ssh": [
+  {
+    "action": "accept",
+    "src": ["<agent 的设备或账号>"],
+    "dst": ["<目标机>"],
+    "users": ["<目标机本地用户名>"]
+  }
+]
+```
+- 高危机器把 `"action"` 改成 `"check"`：每次连接前强制回登录账号重新认证一次，通过后默认 12 小时内免再验（`checkPeriod` 可调，1 分钟至 1 周）。注意 check 对全自动 agent 是个中断点：无人值守的常用机器用 accept，只对真敏感机器用 check。
+- 还可加 `"recorder"` 字段把会话终端流录到指定节点，需要审计时再开。
+
+### 6.4 连接
+```bash
+ssh <本地用户名>@<机器名>
+```
+- 预期：无密钥、无密码，直接登入——认证用的是 tailnet 身份。
+- 不对时怎么办：报权限类错误先回 6.3 查策略（src/dst/users 三个字段逐个对）；报连接拒绝先回 6.1 查服务端形态（十有八九在 Windows 或 GUI 版 Mac 上白试）。
+
+## 7 验收四件套（全过才算这条通道通了，缺一不许报通）
+
+在 agent 端依次执行：
+```bash
+tailscale ping <机器名>                                   # ① 通路：看到 via 直连或 via DERP 中继都算通
+ssh <模板同 5.3 或 6.4> 'hostname && date'                # ② 实登：回显目标机主机名与时间
+scp <本地小文件> <用户>@<机器名>:/tmp/                     # ③ 传文件：再 ssh 过去 sha256sum 与本地 sha256sum 比对一致
+# ④ 复连：目标机重启（或重启其 sshd/tailscaled 服务）后，重复 ②，应当不用任何人工干预直接成功
+```
+注意 scp 指定端口用大写 `-P`，ssh 是小写 `-p`，写错了是经典低级错误。
+
+## 8 故障排查表（先对症状，再下手）
+
+| 症状 | 最可能的原因 | 修法 |
+|---|---|---|
+| `tailscale ping` 超时 | 目标机客户端没登录/掉线/key 过期 | 管理台看该机状态；回第 4.4 节查 key expiry；目标机本地重跑 `tailscale up` |
+| ssh 超时、无任何响应 | 通路没通或目标机防火墙全封 | 先过排查第一行；再查目标机防火墙是否把 tailnet 网段也封了 |
+| Connection refused | sshd 没开或没监听 | 目标机查服务状态（5.1 节命令重跑）；模式二查 `tailscale set --ssh` 是否执行过 |
+| Permission denied (publickey) | 模式一公钥没放对 | 查 authorized_keys 路径与权限（700/600）；Windows 管理员账户查 `C:\ProgramData\ssh\administrators_authorized_keys` 这个特殊路径 |
+| 模式二登不进、无密钥提示机会 | 策略 ssh 段没配或字段写错 | 回 6.3 逐字段核对 src/dst/users |
+| 在 Windows/Mac GUI 机上折腾模式二一直失败 | 服务端形态不支持（铁律 1） | 停手，改走模式一 |
+| host key 警告、连不上 | 目标机重装过系统或换过机 | 先核对新指纹来源可信，再删 agent 端 known_hosts 里该机旧行后重连；来源不明不许删了硬连 |
+| 能 ping 通、ssh 不通 | 防火墙/ACL 只放了 ICMP 或策略未放行 22 | 查目标机防火墙与管理台 ACL |
+| agent 在沙箱/带代理环境里连公网地址必超时 | 透明代理劫持 SSH | 本来就不该连公网地址——改用机器名走 tailnet（100.x 不经公网代理） |
+| 远程命令在 Windows 上行为怪异 | 默认 shell 是 cmd | 显式 `powershell -NoProfile -Command "..."`；中文与路径加引号 |
+| 用了一阵子突然全断 | 设备密钥到期 | 管理台给该机 Disable key expiry 后重新授权入网 |
+
+## 9 日常用法速查（agent 侧）
+
+```bash
+ssh <用户>@<机器名> '<一条命令>'                 # 远程执行并拿回输出
+ssh <用户>@<机器名>                              # 进交互 shell（agent 少用，优先上一行）
+scp <本地文件> <用户>@<机器名>:<目标路径>          # 推文件
+scp <用户>@<机器名>:<远程文件> <本地路径>          # 拉文件
+tailscale status                                 # 看全网设备在线状态
+tailscale ping <机器名>                           # 只验通路不登录
+```
+
+## 10 免费档口径与替代
+
+- Personal 档 $0（2026-11 查官网价目页）：最多 6 个用户、用户自有设备不限台数、含 50 个 tagged 资源、3 个 ACL 组、临时资源 1000 分钟/月，仅限非商业用途。数字改过多次（2026-04 刚把用户上限 3→6、取消 100 台设备上限），引用前查 tailscale.com/pricing 现行页，别背旧数。
+- 不想依赖官方控制面：Headscale（开源自托管），客户端 `tailscale up --login-server <自有服务地址>` 接入，日常功能够用，模式二等高级面以其现行文档为准。
+- 同类替代：ZeroTier、NetBird、Cloudflare Zero Trust，思路同为「先组私有网，再在网内操作」，选型时按免费档与服务端形态支持逐项核对，不凭印象。
+
+## 11 安全收尾清单（交付前逐项打勾）
+
+- [ ] 目标机公网 SSH 已按 5.4 收口，并从公网侧试连验证被拒
+- [ ] 服务器类节点已 Disable key expiry
+- [ ] ACL/策略不是默认全通到底：至少 SSH 这一项按「哪台能登哪台」收紧过
+- [ ] agent 私钥只在 agent 本机受限目录，公钥分发有记录（放了哪几台）
+- [ ] 验收四件套原始输出留证（哪天、哪台机、回显是什么）
+- [ ] 机器名、登录用户、模式（一/二）、收口方式写进自己的 TOOLS/连接文档，下次直接照用
